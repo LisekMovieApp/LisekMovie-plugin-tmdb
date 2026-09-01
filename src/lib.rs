@@ -82,15 +82,18 @@ pub struct TmdbSeriesMatch {
     pub backdrop_path: Option<String>,
 }
 
-/// The poster/backdrop `/images` picks out for one movie or series, once
-/// [`pick_best_image`] has already applied the language-priority chain —
-/// see [`TmdbClient::movie_images`]/[`TmdbClient::series_images`]. Either
+/// The poster/backdrop/logo `/images` picks out for one movie or series,
+/// once [`pick_best_image`] has already applied the language-priority chain
+/// — see [`TmdbClient::movie_images`]/[`TmdbClient::series_images`]. Any
 /// field can still be `None`: TMDB genuinely has no image of that kind for
-/// some titles, language priority or not.
+/// some titles, language priority or not — `logo_path` specifically is also
+/// `None` whenever every logo TMDB has cataloged is a non-PNG format (see
+/// [`TmdbClient::fetch_images`] for why only `.png` logos are considered).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TmdbImages {
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    pub logo_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +115,13 @@ struct ImagesResponse {
     posters: Vec<RawImage>,
     #[serde(default)]
     backdrops: Vec<RawImage>,
+    /// Transparent title-logo artwork — the asset the admin asked for so
+    /// the Hero Banner can show a real logo image instead of plain HTML
+    /// text. TMDB has no "banner" (wide artwork) image type at all
+    /// alongside this one — see [`lisek_plugin_api::ProviderMatch`]'s own
+    /// doc comment for why `banner_url` stays unset from this provider.
+    #[serde(default)]
+    logos: Vec<RawImage>,
 }
 
 /// Picks the best image out of one `/images` response array (`posters` or
@@ -257,15 +267,46 @@ impl TmdbClient {
 
     /// Searches TMDB for a movie by title (and, when known, release year —
     /// TMDB's `year` search param narrows results considerably for common
-    /// titles, which matters for avoiding a remake/reboot mismatch) and
-    /// returns the best (first, TMDB's own relevance-ranked) match, or
-    /// `None` if TMDB found nothing even after the year-less retry below.
+    /// titles, which matters for avoiding a remake/reboot mismatch),
+    /// returning the best (first, TMDB's own relevance-ranked) match across
+    /// an increasingly loose cascade of query candidates (see
+    /// [`lisek_plugin_api::query_candidates`]) — the plain normalized
+    /// title first, then a diacritics-stripped variant, then just its
+    /// first two words — stopping at the first candidate that finds
+    /// anything. `primary_language` is passed to TMDB as the `language`
+    /// search param on every attempt: a query string in the server's own
+    /// language (a Polish title, say) needs TMDB told what language it's
+    /// in to match well against that language's translated/alternative
+    /// titles, not just the English-default title TMDB assumes otherwise.
     pub async fn search_movie(
         &self,
         title: &str,
         year: Option<i32>,
+        primary_language: &str,
     ) -> Result<Option<TmdbMovieMatch>, TmdbError> {
-        let result = self.search_movie_raw(title, year).await?;
+        for candidate in lisek_plugin_api::query_candidates(title) {
+            if let Some(found) = self
+                .search_movie_candidate(&candidate, year, primary_language)
+                .await?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One query-candidate's worth of searching: the year-scoped attempt,
+    /// then — only if that comes up empty and a year was actually given —
+    /// a retry with the year dropped. Factored out of [`Self::search_movie`]
+    /// so the query-candidate cascade above can call this once per
+    /// candidate without duplicating the year-retry logic at each step.
+    async fn search_movie_candidate(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        primary_language: &str,
+    ) -> Result<Option<TmdbMovieMatch>, TmdbError> {
+        let result = self.search_movie_raw(title, year, primary_language).await?;
         if result.is_some() || year.is_none() {
             return Ok(result);
         }
@@ -284,17 +325,19 @@ impl TmdbClient {
             year,
             "year-scoped TMDB search found nothing — retrying without the year"
         );
-        self.search_movie_raw(title, None).await
+        self.search_movie_raw(title, None, primary_language).await
     }
 
     async fn search_movie_raw(
         &self,
         title: &str,
         year: Option<i32>,
+        primary_language: &str,
     ) -> Result<Option<TmdbMovieMatch>, TmdbError> {
         let mut query = vec![
             ("api_key", self.api_key.clone()),
             ("query", title.to_string()),
+            ("language", primary_language.to_string()),
         ];
         if let Some(year) = year {
             query.push(("year", year.to_string()));
@@ -320,14 +363,40 @@ impl TmdbClient {
         Ok(body.results.into_iter().next().map(Into::into))
     }
 
-    /// Searches TMDB for a TV series by title. TMDB's own database covers
-    /// TV well enough (not just movies) that this is a usable alternative
-    /// to TVDB for series metadata, not just a movies-only client.
-    pub async fn search_series(&self, title: &str) -> Result<Option<TmdbSeriesMatch>, TmdbError> {
+    /// Searches TMDB for a TV series by title, across the same
+    /// query-candidate cascade [`Self::search_movie`] uses (see
+    /// [`lisek_plugin_api::query_candidates`]) — no year param exists for
+    /// a series search here (the scanner's series detection doesn't parse
+    /// one out of a series-level folder name), so there's no year-retry
+    /// step, just the candidate loop. TMDB's own database covers TV well
+    /// enough (not just movies) that this is a usable alternative to TVDB
+    /// for series metadata, not just a movies-only client.
+    pub async fn search_series(
+        &self,
+        title: &str,
+        primary_language: &str,
+    ) -> Result<Option<TmdbSeriesMatch>, TmdbError> {
+        for candidate in lisek_plugin_api::query_candidates(title) {
+            if let Some(found) = self.search_series_raw(&candidate, primary_language).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn search_series_raw(
+        &self,
+        title: &str,
+        primary_language: &str,
+    ) -> Result<Option<TmdbSeriesMatch>, TmdbError> {
         let response = self
             .http
             .get(format!("{}/search/tv", self.base_url))
-            .query(&[("api_key", self.api_key.as_str()), ("query", title)])
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("query", title),
+                ("language", primary_language),
+            ])
             .send()
             .await?;
 
@@ -390,10 +459,26 @@ impl TmdbClient {
             .await
             .map_err(|err| TmdbError::UnexpectedResponse(err.to_string()))?;
 
+        // Only PNG logos are considered: TMDB's `logos` array can also
+        // contain SVG entries, and this app serves whatever bytes it
+        // downloads back out with a fixed `image/png` content-type (same
+        // fixed-type approach `media.rs` already uses for posters/
+        // backdrops as `image/jpeg`) rather than sniffing the real format
+        // — accepting an SVG here would mean serving vector markup
+        // mislabeled as a raster image. Skipping a non-PNG logo is treated
+        // exactly like "TMDB has no logo for this title", not an error.
+        let png_logos: Vec<RawImage> = body
+            .logos
+            .into_iter()
+            .filter(|image| image.file_path.to_lowercase().ends_with(".png"))
+            .collect();
+
         Ok(TmdbImages {
             poster_path: pick_best_image(&body.posters, primary_language)
                 .map(|image| image.file_path.clone()),
             backdrop_path: pick_best_image(&body.backdrops, primary_language)
+                .map(|image| image.file_path.clone()),
+            logo_path: pick_best_image(&png_logos, primary_language)
                 .map(|image| image.file_path.clone()),
         })
     }
@@ -461,10 +546,17 @@ impl MetadataProvider for TmdbProvider {
         primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
         let client = TmdbClient::new(self.api_key.clone());
-        let Some(m) = client.search_movie(query.title, query.year).await? else {
+        let Some(m) = client
+            .search_movie(query.title, query.year, primary_language)
+            .await?
+        else {
             return Ok(None);
         };
         let images_result = client.movie_images(m.tmdb_id, primary_language).await;
+        let logo_path = images_result
+            .as_ref()
+            .ok()
+            .and_then(|images| images.logo_path.clone());
         let (poster_path, backdrop_path) = images_or_fallback(
             images_result,
             query.title,
@@ -474,6 +566,8 @@ impl MetadataProvider for TmdbProvider {
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
+            logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
+            banner_url: None,
             fields: serde_json::json!({
                 "tmdb_id": m.tmdb_id,
                 "overview": m.overview,
@@ -487,10 +581,14 @@ impl MetadataProvider for TmdbProvider {
         primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
         let client = TmdbClient::new(self.api_key.clone());
-        let Some(m) = client.search_series(query.title).await? else {
+        let Some(m) = client.search_series(query.title, primary_language).await? else {
             return Ok(None);
         };
         let images_result = client.series_images(m.tmdb_id, primary_language).await;
+        let logo_path = images_result
+            .as_ref()
+            .ok()
+            .and_then(|images| images.logo_path.clone());
         let (poster_path, backdrop_path) = images_or_fallback(
             images_result,
             query.title,
@@ -500,6 +598,8 @@ impl MetadataProvider for TmdbProvider {
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
+            logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
+            banner_url: None,
             fields: serde_json::json!({
                 "tmdb_id": m.tmdb_id,
                 "overview": m.overview,
@@ -539,8 +639,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/search/movie"))
             .and(query_param("api_key", "test-key"))
-            .and(query_param("query", "Inception"))
+            // Normalized (lowercased) by `query_candidates` before this
+            // client ever sees it — see the `normalize_query_title` tests
+            // in `lisek-plugin-api` for why that's always safe to apply.
+            .and(query_param("query", "inception"))
             .and(query_param("year", "2010"))
+            .and(query_param("language", "en"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "results": [{
                     "id": 27205,
@@ -555,7 +659,10 @@ mod tests {
             .await;
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
-        let result = client.search_movie("Inception", Some(2010)).await.unwrap();
+        let result = client
+            .search_movie("Inception", Some(2010), "en")
+            .await
+            .unwrap();
 
         assert_eq!(
             result,
@@ -575,7 +682,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/search/movie"))
-            .and(query_param("query", "Some Movie"))
+            .and(query_param("query", "some movie"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
             )
@@ -583,7 +690,7 @@ mod tests {
             .await;
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
-        let result = client.search_movie("Some Movie", None).await.unwrap();
+        let result = client.search_movie("Some Movie", None, "en").await.unwrap();
         assert_eq!(result, None);
     }
 
@@ -600,7 +707,7 @@ mod tests {
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
         let result = client
-            .search_movie("Nonexistent Film Xyz", None)
+            .search_movie("Nonexistent Film Xyz", None, "en")
             .await
             .unwrap();
         assert_eq!(result, None);
@@ -618,7 +725,7 @@ mod tests {
             .await;
 
         let client = TmdbClient::with_base_url("bad-key", server.uri());
-        let result = client.search_movie("Inception", None).await;
+        let result = client.search_movie("Inception", None, "en").await;
         assert!(matches!(result, Err(TmdbError::Unauthorized)));
     }
 
@@ -627,7 +734,8 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/search/tv"))
-            .and(query_param("query", "Breaking Bad"))
+            .and(query_param("query", "breaking bad"))
+            .and(query_param("language", "en"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "results": [{
                     "id": 1396,
@@ -641,7 +749,7 @@ mod tests {
             .await;
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
-        let result = client.search_series("Breaking Bad").await.unwrap();
+        let result = client.search_series("Breaking Bad", "en").await.unwrap();
 
         assert_eq!(
             result,
@@ -663,17 +771,19 @@ mod tests {
         // filename year and TMDB's own primary-release-date year.
         Mock::given(method("GET"))
             .and(path("/search/movie"))
-            .and(query_param("query", "Asterix and Obelix"))
+            .and(query_param("query", "asterix and obelix"))
             .and(query_param("year", "2012"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
             )
             .mount(&server)
             .await;
-        // The retry, with the year dropped, is what actually finds it.
+        // The retry, with the year dropped, is what actually finds it —
+        // still the *first* query candidate (the plain normalized title),
+        // never getting to the two-word fallback.
         Mock::given(method("GET"))
             .and(path("/search/movie"))
-            .and(query_param("query", "Asterix and Obelix"))
+            .and(query_param("query", "asterix and obelix"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "results": [{
                     "id": 76758,
@@ -689,7 +799,7 @@ mod tests {
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
         let result = client
-            .search_movie("Asterix and Obelix", Some(2012))
+            .search_movie("Asterix and Obelix", Some(2012), "en")
             .await
             .unwrap();
 
@@ -703,10 +813,13 @@ mod tests {
         // here, there would be nothing left to drop from the query, so a
         // second identical request would just hit this same mock again.
         // `.expect(1)` catches that: a retry loop or a duplicate request
-        // fails the test instead of silently doubling TMDB traffic.
+        // fails the test instead of silently doubling TMDB traffic. "Some
+        // Movie" is only two words, so `query_candidates` produces exactly
+        // one candidate here too (its own first-two-words fallback would
+        // duplicate the normalized form) — nothing left to cascade into.
         Mock::given(method("GET"))
             .and(path("/search/movie"))
-            .and(query_param("query", "Some Movie"))
+            .and(query_param("query", "some movie"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
             )
@@ -715,8 +828,68 @@ mod tests {
             .await;
 
         let client = TmdbClient::with_base_url("test-key", server.uri());
-        let result = client.search_movie("Some Movie", None).await.unwrap();
+        let result = client.search_movie("Some Movie", None, "en").await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn search_movie_falls_back_to_the_first_two_words_once_the_full_title_finds_nothing() {
+        // The exact real-world regression this cascade exists for: TMDB
+        // rejects the full, correctly-parsed title (both with and without
+        // the year), so the last-resort two-word query is what actually
+        // finds the match — see `query_candidates`'s own tests in
+        // `lisek-plugin-api` for why "asterix i" is the third and last
+        // candidate for this exact title.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie"))
+            .and(query_param(
+                "query",
+                "asterix i obelix w służbie jej królewskiej mości",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie"))
+            .and(query_param(
+                "query",
+                "asterix i obelix w sluzbie jej krolewskiej mosci",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie"))
+            .and(query_param("query", "asterix i"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "id": 76758,
+                    "title": "Asterix and Obelix: God Save Britannia",
+                    "release_date": "2012-10-03",
+                    "overview": "Asterix and Obelix travel to Britannia...",
+                    "poster_path": "/britannia.jpg",
+                    "backdrop_path": "/britannia-bd.jpg"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TmdbClient::with_base_url("test-key", server.uri());
+        let result = client
+            .search_movie(
+                "Asterix i Obelix W Służbie Jej Królewskiej Mości",
+                Some(2012),
+                "pl",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.map(|m| m.tmdb_id), Some(76758));
     }
 
     #[test]
@@ -835,6 +1008,56 @@ mod tests {
 
         assert_eq!(images.poster_path, Some("/poster-pl.jpg".to_string()));
         assert_eq!(images.backdrop_path, Some("/backdrop-null.jpg".to_string()));
+    }
+
+    #[tokio::test]
+    async fn movie_images_picks_a_png_logo_and_applies_the_same_language_chain() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movie/27205/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posters": [],
+                "backdrops": [],
+                "logos": [
+                    { "file_path": "/logo-en.png", "iso_639_1": "en", "vote_average": 9.0 },
+                    { "file_path": "/logo-pl.png", "iso_639_1": "pl", "vote_average": 3.0 }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TmdbClient::with_base_url("test-key", server.uri());
+        let images = client.movie_images(27205, "pl").await.unwrap();
+
+        assert_eq!(images.logo_path, Some("/logo-pl.png".to_string()));
+    }
+
+    #[tokio::test]
+    async fn movie_images_skips_a_non_png_logo_rather_than_serving_it_mislabeled() {
+        // TMDB's `logos` array can carry SVG entries — this app serves
+        // whatever it downloads back out with a fixed `image/png`
+        // content-type, so a non-PNG logo is treated the same as "no
+        // logo" rather than risking mislabeled/broken content. Only the
+        // higher-voted PNG entry should win here, not the SVG despite its
+        // higher vote_average.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movie/27205/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posters": [],
+                "backdrops": [],
+                "logos": [
+                    { "file_path": "/logo-vector.svg", "iso_639_1": "en", "vote_average": 9.0 },
+                    { "file_path": "/logo-raster.png", "iso_639_1": "en", "vote_average": 1.0 }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TmdbClient::with_base_url("test-key", server.uri());
+        let images = client.movie_images(27205, "en").await.unwrap();
+
+        assert_eq!(images.logo_path, Some("/logo-raster.png".to_string()));
     }
 
     #[tokio::test]

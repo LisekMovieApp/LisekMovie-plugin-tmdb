@@ -202,6 +202,163 @@ struct RawSeriesResult {
     backdrop_path: Option<String>,
 }
 
+/// The collection ("box set") a movie belongs to, from
+/// `/movie/{id}`'s `belongs_to_collection`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TmdbCollectionRef {
+    pub id: u64,
+    pub name: String,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
+/// What [`TmdbClient::movie_details`] adds to a search match.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TmdbMovieDetails {
+    pub collection: Option<TmdbCollectionRef>,
+    /// `(country, certification)` pairs, e.g. `("US", "PG-13")`.
+    pub certifications: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMovieDetails {
+    belongs_to_collection: Option<TmdbCollectionRef>,
+    #[serde(default)]
+    release_dates: Option<RawReleaseDates>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReleaseDates {
+    #[serde(default)]
+    results: Vec<RawCountryReleases>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCountryReleases {
+    iso_3166_1: String,
+    #[serde(default)]
+    release_dates: Vec<RawRelease>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRelease {
+    #[serde(default)]
+    certification: String,
+    /// 1 premiere, 2 limited theatrical, 3 theatrical, 4 digital,
+    /// 5 physical, 6 TV.
+    #[serde(default, rename = "type")]
+    release_type: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawContentRatings {
+    #[serde(default)]
+    results: Vec<RawContentRating>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawContentRating {
+    iso_3166_1: String,
+    #[serde(default)]
+    rating: String,
+}
+
+/// One non-empty certification per country. A country lists one per
+/// release; the theatrical one (type 3) wins, then the lowest type.
+fn certifications_from(raw: RawReleaseDates) -> Vec<(String, String)> {
+    raw.results
+        .into_iter()
+        .filter_map(|country| {
+            let mut releases: Vec<RawRelease> = country
+                .release_dates
+                .into_iter()
+                .filter(|r| !r.certification.trim().is_empty())
+                .collect();
+            releases.sort_by_key(|r| (r.release_type != 3, r.release_type));
+            releases
+                .into_iter()
+                .next()
+                .map(|r| (country.iso_3166_1, r.certification.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Countries whose certification is used for the age rating, in order.
+/// Fixed rather than derived from the scan language, so a rescan in
+/// another language never changes what a restricted account can see.
+const RATING_COUNTRIES: &[&str] = &["US", "GB", "DE", "FR", "PL", "NL", "AU", "CA"];
+
+/// Minimum viewer age for one country's certification, `None` when the
+/// value means "not rated" or is unknown.
+pub fn age_from_certification(country: &str, certification: &str) -> Option<i32> {
+    let cert = certification.trim().to_ascii_uppercase();
+    let mapped = match (country, cert.as_str()) {
+        // MPA (films) and TV Parental Guidelines.
+        ("US", "G" | "TV-Y" | "TV-G") => Some(0),
+        ("US", "TV-Y7" | "TV-Y7-FV") => Some(7),
+        ("US", "PG" | "TV-PG") => Some(10),
+        ("US", "PG-13") => Some(13),
+        ("US", "TV-14") => Some(14),
+        ("US", "R" | "TV-MA") => Some(17),
+        ("US", "NC-17") => Some(18),
+        ("US", _) => None,
+        // BBFC.
+        ("GB", "U") => Some(0),
+        ("GB", "PG") => Some(8),
+        ("GB", "12A") => Some(12),
+        ("GB", "R18") => Some(18),
+        // Australia (ACB).
+        ("AU", "G") => Some(0),
+        ("AU", "PG") => Some(8),
+        ("AU", "M") => Some(15),
+        ("AU", "MA15+" | "MA 15+") => Some(15),
+        ("AU", "R18+" | "X18+") => Some(18),
+        // "All ages" in several systems.
+        (_, "U" | "TP" | "AL" | "ATP" | "L" | "BTL" | "0+") => Some(0),
+        _ => None,
+    };
+    mapped.or_else(|| {
+        // Numeric systems: FSK 12, 16, 12+, -12, M/16, K-7.
+        let digits: String = cert
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<i32>().ok().filter(|age| (0..=21).contains(age))
+    })
+}
+
+/// `(age, certification, country)` from the first country in
+/// [`RATING_COUNTRIES`] with a usable certification, then any other.
+pub fn pick_age_rating(certifications: &[(String, String)]) -> Option<(i32, String, String)> {
+    let rated = |country: &str, cert: &str| {
+        age_from_certification(country, cert).map(|age| (age, cert.to_string(), country.to_string()))
+    };
+    RATING_COUNTRIES
+        .iter()
+        .find_map(|preferred| {
+            certifications
+                .iter()
+                .filter(|(country, _)| country == preferred)
+                .find_map(|(country, cert)| rated(country, cert))
+        })
+        .or_else(|| {
+            let mut others: Vec<&(String, String)> = certifications.iter().collect();
+            others.sort();
+            others.into_iter().find_map(|(country, cert)| rated(country, cert))
+        })
+}
+
+/// Adds `age_rating`/`certification`/`certification_country` to a match's
+/// fields when a certification maps to an age.
+fn add_age_rating(fields: &mut serde_json::Value, certifications: &[(String, String)]) {
+    if let Some((age, certification, country)) = pick_age_rating(certifications) {
+        fields["age_rating"] = serde_json::json!(age);
+        fields["certification"] = serde_json::json!(certification);
+        fields["certification_country"] = serde_json::json!(country);
+    }
+}
+
 static RELEASE_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d{4})-\d{2}-\d{2}$").unwrap());
 
@@ -437,6 +594,68 @@ impl TmdbClient {
             .await
     }
 
+    /// `/movie/{id}` with its release dates: the collection the movie
+    /// belongs to and every country's certification. `language` localizes
+    /// the collection name and artwork.
+    pub async fn movie_details(
+        &self,
+        tmdb_id: u64,
+        primary_language: &str,
+    ) -> Result<TmdbMovieDetails, TmdbError> {
+        let body: RawMovieDetails = self
+            .get_json(
+                &format!("/movie/{tmdb_id}"),
+                &[
+                    ("language", primary_language),
+                    ("append_to_response", "release_dates"),
+                ],
+            )
+            .await?;
+        Ok(TmdbMovieDetails {
+            collection: body.belongs_to_collection,
+            certifications: body.release_dates.map(certifications_from).unwrap_or_default(),
+        })
+    }
+
+    /// `/tv/{id}/content_ratings`: `(country, rating)` pairs.
+    pub async fn series_content_ratings(
+        &self,
+        tmdb_id: u64,
+    ) -> Result<Vec<(String, String)>, TmdbError> {
+        let body: RawContentRatings = self
+            .get_json(&format!("/tv/{tmdb_id}/content_ratings"), &[])
+            .await?;
+        Ok(body
+            .results
+            .into_iter()
+            .filter(|r| !r.rating.trim().is_empty())
+            .map(|r| (r.iso_3166_1, r.rating.trim().to_string()))
+            .collect())
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T, TmdbError> {
+        let mut query = vec![("api_key", self.api_key.as_str())];
+        query.extend_from_slice(params);
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .query(&query)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(TmdbError::Unauthorized);
+        }
+        response
+            .error_for_status()?
+            .json()
+            .await
+            .map_err(|err| TmdbError::UnexpectedResponse(err.to_string()))
+    }
+
     async fn fetch_images(
         &self,
         path: &str,
@@ -524,13 +743,24 @@ fn images_or_fallback(
 /// doc comment for the compile-time-extension architecture this fits into.
 pub struct TmdbProvider {
     api_key: String,
+    base_url: String,
 }
 
 impl TmdbProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    /// Tests point the provider at a mock server.
+    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            base_url: base_url.into(),
         }
+    }
+
+    fn client(&self) -> TmdbClient {
+        TmdbClient::with_base_url(self.api_key.clone(), self.base_url.clone())
     }
 }
 
@@ -545,7 +775,7 @@ impl MetadataProvider for TmdbProvider {
         query: &MovieQuery<'_>,
         primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        let client = TmdbClient::new(self.api_key.clone());
+        let client = self.client();
         let Some(m) = client
             .search_movie(query.title, query.year, primary_language)
             .await?
@@ -563,15 +793,41 @@ impl MetadataProvider for TmdbProvider {
             m.poster_path.as_deref(),
             m.backdrop_path.as_deref(),
         );
+        let mut fields = serde_json::json!({
+            "tmdb_id": m.tmdb_id,
+            "overview": m.overview,
+        });
+        // Collection and certification. A failed lookup leaves both keys
+        // out (the server then keeps the film's current collection); a
+        // successful one without a collection says so with `null`.
+        match client.movie_details(m.tmdb_id, primary_language).await {
+            Ok(details) => {
+                fields["collection"] = details
+                    .collection
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id.to_string(),
+                            "name": c.name,
+                            "poster_url": c.poster_path.as_deref().map(|p| image_url(p, "w500")),
+                            "backdrop_url": c.backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
+                        })
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                add_age_rating(&mut fields, &details.certifications);
+            }
+            Err(err) => tracing::warn!(
+                provider = "tmdb",
+                %err,
+                title = query.title,
+                "movie details lookup failed — no collection or age rating this time"
+            ),
+        }
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
-            fields: serde_json::json!({
-                "tmdb_id": m.tmdb_id,
-                "overview": m.overview,
-            }),
+            fields,
         }))
     }
 
@@ -580,7 +836,7 @@ impl MetadataProvider for TmdbProvider {
         query: &SeriesQuery<'_>,
         primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        let client = TmdbClient::new(self.api_key.clone());
+        let client = self.client();
         let Some(m) = client.search_series(query.title, primary_language).await? else {
             return Ok(None);
         };
@@ -595,15 +851,25 @@ impl MetadataProvider for TmdbProvider {
             m.poster_path.as_deref(),
             m.backdrop_path.as_deref(),
         );
+        let mut fields = serde_json::json!({
+            "tmdb_id": m.tmdb_id,
+            "overview": m.overview,
+        });
+        match client.series_content_ratings(m.tmdb_id).await {
+            Ok(ratings) => add_age_rating(&mut fields, &ratings),
+            Err(err) => tracing::warn!(
+                provider = "tmdb",
+                %err,
+                title = query.title,
+                "content rating lookup failed — no age rating this time"
+            ),
+        }
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
-            fields: serde_json::json!({
-                "tmdb_id": m.tmdb_id,
-                "overview": m.overview,
-            }),
+            fields,
         }))
     }
 }
@@ -1100,5 +1366,223 @@ mod tests {
     #[test]
     fn provider_key_is_tmdb() {
         assert_eq!(TmdbProvider::new("k").provider_key(), "tmdb");
+    }
+
+    #[test]
+    fn certifications_map_to_minimum_ages() {
+        assert_eq!(age_from_certification("US", "PG-13"), Some(13));
+        assert_eq!(age_from_certification("US", "R"), Some(17));
+        assert_eq!(age_from_certification("US", "TV-Y7"), Some(7));
+        assert_eq!(age_from_certification("US", "NR"), None);
+        assert_eq!(age_from_certification("GB", "12A"), Some(12));
+        assert_eq!(age_from_certification("GB", "U"), Some(0));
+        assert_eq!(age_from_certification("DE", "FSK 16"), Some(16));
+        assert_eq!(age_from_certification("DE", "6"), Some(6));
+        assert_eq!(age_from_certification("PL", "12+"), Some(12));
+        assert_eq!(age_from_certification("FR", "TP"), Some(0));
+        assert_eq!(age_from_certification("FR", "-16"), Some(16));
+        assert_eq!(age_from_certification("BR", "L"), Some(0));
+        assert_eq!(age_from_certification("XX", "Unrated"), None);
+        assert_eq!(age_from_certification("XX", "99"), None);
+    }
+
+    #[test]
+    fn age_rating_prefers_the_fixed_country_order_then_any_country() {
+        let certs = vec![
+            ("PL".to_string(), "15".to_string()),
+            ("US".to_string(), "NR".to_string()),
+            ("DE".to_string(), "12".to_string()),
+        ];
+        // US has no usable rating; DE comes before PL in the fixed order.
+        assert_eq!(
+            pick_age_rating(&certs),
+            Some((12, "12".to_string(), "DE".to_string()))
+        );
+        let others = vec![
+            ("SE".to_string(), "11".to_string()),
+            ("BR".to_string(), "14".to_string()),
+        ];
+        assert_eq!(
+            pick_age_rating(&others),
+            Some((14, "14".to_string(), "BR".to_string()))
+        );
+        assert_eq!(pick_age_rating(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn movie_details_reads_the_collection_and_the_theatrical_certification() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .and(query_param("api_key", "test-key"))
+            .and(query_param("language", "pl"))
+            .and(query_param("append_to_response", "release_dates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 11,
+                "belongs_to_collection": {
+                    "id": 10, "name": "Gwiezdne wojny - kolekcja",
+                    "poster_path": "/sw.jpg", "backdrop_path": "/sw-bg.jpg"
+                },
+                "release_dates": { "results": [
+                    { "iso_3166_1": "US", "release_dates": [
+                        { "certification": "", "type": 1 },
+                        { "certification": "PG", "type": 3 },
+                        { "certification": "G", "type": 5 }
+                    ]},
+                    { "iso_3166_1": "DE", "release_dates": [
+                        { "certification": "", "type": 3 }
+                    ]}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TmdbClient::with_base_url("test-key", server.uri());
+        let details = client.movie_details(11, "pl").await.unwrap();
+
+        assert_eq!(
+            details.collection,
+            Some(TmdbCollectionRef {
+                id: 10,
+                name: "Gwiezdne wojny - kolekcja".to_string(),
+                poster_path: Some("/sw.jpg".to_string()),
+                backdrop_path: Some("/sw-bg.jpg".to_string()),
+            })
+        );
+        assert_eq!(details.certifications, vec![("US".to_string(), "PG".to_string())]);
+    }
+
+    async fn mount_movie_search(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/search/movie"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "id": 11, "title": "Star Wars", "release_date": "1977-05-25",
+                    "overview": "A long time ago...", "poster_path": "/p.jpg", "backdrop_path": "/b.jpg"
+                }]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posters": [], "backdrops": []
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn find_movie_adds_collection_and_age_rating_fields() {
+        let server = MockServer::start().await;
+        mount_movie_search(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "belongs_to_collection": {
+                    "id": 10, "name": "Star Wars Collection",
+                    "poster_path": "/sw.jpg", "backdrop_path": null
+                },
+                "release_dates": { "results": [
+                    { "iso_3166_1": "US", "release_dates": [{ "certification": "PG", "type": 3 }] }
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("test-key", server.uri());
+        let found = provider
+            .find_movie(&MovieQuery { title: "Star Wars", year: Some(1977) }, "en")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.fields["tmdb_id"], 11);
+        assert_eq!(
+            found.fields["collection"],
+            serde_json::json!({
+                "id": "10",
+                "name": "Star Wars Collection",
+                "poster_url": "https://image.tmdb.org/t/p/w500/sw.jpg",
+                "backdrop_url": null
+            })
+        );
+        assert_eq!(found.fields["age_rating"], 10);
+        assert_eq!(found.fields["certification"], "PG");
+        assert_eq!(found.fields["certification_country"], "US");
+        // The search result's own images are the fallback.
+        assert_eq!(
+            found.poster_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/p.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_movie_without_a_collection_says_null_and_a_failed_lookup_says_nothing() {
+        let server = MockServer::start().await;
+        mount_movie_search(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "belongs_to_collection": null,
+                "release_dates": { "results": [] }
+            })))
+            .mount(&server)
+            .await;
+        let provider = TmdbProvider::with_base_url("test-key", server.uri());
+        let query = MovieQuery { title: "Star Wars", year: Some(1977) };
+        let found = provider.find_movie(&query, "en").await.unwrap().unwrap();
+        assert!(found.fields["collection"].is_null());
+        assert!(found.fields.get("collection").is_some());
+        assert!(found.fields.get("age_rating").is_none());
+
+        let failing = MockServer::start().await;
+        mount_movie_search(&failing).await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&failing)
+            .await;
+        let provider = TmdbProvider::with_base_url("test-key", failing.uri());
+        let found = provider.find_movie(&query, "en").await.unwrap().unwrap();
+        assert!(found.fields.get("collection").is_none());
+        assert_eq!(found.fields["overview"], "A long time ago...");
+    }
+
+    #[tokio::test]
+    async fn find_series_adds_the_content_rating() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/tv"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "id": 1396, "name": "Breaking Bad", "overview": "x" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tv/1396/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tv/1396/content_ratings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    { "iso_3166_1": "DE", "rating": "16" },
+                    { "iso_3166_1": "US", "rating": "TV-MA" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("test-key", server.uri());
+        let found = provider
+            .find_series(&SeriesQuery { title: "Breaking Bad" }, "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.fields["age_rating"], 17);
+        assert_eq!(found.fields["certification"], "TV-MA");
+        assert!(found.fields.get("collection").is_none());
     }
 }

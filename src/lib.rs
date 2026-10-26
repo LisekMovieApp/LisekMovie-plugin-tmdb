@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lisek_plugin_api::{
-    MediaKind, MetadataProvider, MovieQuery, PersonRole, ProviderCandidate, ProviderError,
-    ProviderMatch, ProviderPerson, ProviderPersonDetails, SeriesQuery,
+    MediaKind, MetadataProvider, MovieQuery, PersonRole, ProviderCandidate, ProviderEpisode,
+    ProviderError, ProviderMatch, ProviderPerson, ProviderPersonDetails, ProviderSeason,
+    SeriesQuery,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -234,6 +235,98 @@ pub struct TmdbMovieDetails {
     pub certifications: Vec<(String, String)>,
     /// Main cast, directors and writers; `None` without `credits`.
     pub people: Option<Vec<ProviderPerson>>,
+    /// Original title, tagline, genres, studios, keywords, rating, ids.
+    pub extras: TmdbExtras,
+}
+
+/// The detail-page facts (Faza 9) a movie or series page carries:
+/// written into `provider_data` by [`add_extras`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TmdbExtras {
+    pub original_title: Option<String>,
+    pub tagline: Option<String>,
+    pub runtime_minutes: Option<u32>,
+    /// TMDB's user score (0-10), only with at least one vote.
+    pub rating: Option<f64>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    /// TMDB keywords ("car race", "sequel"), shown as tags.
+    pub keywords: Vec<String>,
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<u64>,
+}
+
+/// Keywords kept per title: TMDB lists dozens for popular films.
+pub const MAX_KEYWORDS: usize = 20;
+
+#[derive(Debug, Default, Deserialize)]
+struct RawNamed {
+    #[serde(default)]
+    name: String,
+}
+
+/// Movies wrap keywords in `keywords`, series in `results`.
+#[derive(Debug, Default, Deserialize)]
+struct RawKeywords {
+    #[serde(default)]
+    keywords: Vec<RawNamed>,
+    #[serde(default)]
+    results: Vec<RawNamed>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawExternalIds {
+    imdb_id: Option<String>,
+    tvdb_id: Option<u64>,
+}
+
+fn names(list: Vec<RawNamed>, limit: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in list.into_iter().map(|n| n.name.trim().to_string()) {
+        if !name.is_empty() && !out.contains(&name) && out.len() < limit {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn rating_from(vote_average: Option<f64>, vote_count: Option<u64>) -> Option<f64> {
+    let average = vote_average.filter(|v| v.is_finite() && *v > 0.0)?;
+    (vote_count.unwrap_or(0) > 0).then(|| (average * 10.0).round() / 10.0)
+}
+
+/// An IMDb title id (`tt0322259`); anything else is dropped.
+fn imdb_title_id(value: Option<String>) -> Option<String> {
+    let id = blank_to_none(value)?;
+    (id.starts_with("tt") && id.len() > 2 && id[2..].chars().all(|c| c.is_ascii_digit())).then_some(id)
+}
+
+/// `fields.original_title`, `tagline`, `runtime_minutes`, `rating`,
+/// `genres`, `studios`, `tags`, `imdb_id`, `tvdb_id`. Lists are always
+/// written (empty when TMDB has none); single values only when known.
+fn add_extras(fields: &mut serde_json::Value, extras: &TmdbExtras) {
+    let mut set = |key: &str, value: serde_json::Value| fields[key] = value;
+    if let Some(v) = &extras.original_title {
+        set("original_title", serde_json::json!(v));
+    }
+    if let Some(v) = &extras.tagline {
+        set("tagline", serde_json::json!(v));
+    }
+    if let Some(v) = extras.runtime_minutes {
+        set("runtime_minutes", serde_json::json!(v));
+    }
+    if let Some(v) = extras.rating {
+        set("rating", serde_json::json!(v));
+    }
+    set("genres", serde_json::json!(extras.genres));
+    set("studios", serde_json::json!(extras.studios));
+    set("tags", serde_json::json!(extras.keywords));
+    if let Some(v) = &extras.imdb_id {
+        set("imdb_id", serde_json::json!(v));
+    }
+    if let Some(v) = extras.tvdb_id {
+        set("tvdb_id", serde_json::json!(v));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +344,18 @@ struct RawMovieDetails {
     release_dates: Option<RawReleaseDates>,
     #[serde(default)]
     credits: Option<RawCredits>,
+    original_title: Option<String>,
+    tagline: Option<String>,
+    runtime: Option<u32>,
+    vote_average: Option<f64>,
+    vote_count: Option<u64>,
+    #[serde(default)]
+    genres: Vec<RawNamed>,
+    #[serde(default)]
+    production_companies: Vec<RawNamed>,
+    imdb_id: Option<String>,
+    #[serde(default)]
+    keywords: Option<RawKeywords>,
 }
 
 /// Actors billed beyond this are left out (TMDB lists every extra).
@@ -510,6 +615,90 @@ struct RawSeriesDetails {
     backdrop_path: Option<String>,
     #[serde(default)]
     content_ratings: Option<RawContentRatings>,
+    original_name: Option<String>,
+    tagline: Option<String>,
+    #[serde(default)]
+    episode_run_time: Vec<u32>,
+    vote_average: Option<f64>,
+    vote_count: Option<u64>,
+    #[serde(default)]
+    genres: Vec<RawNamed>,
+    #[serde(default)]
+    production_companies: Vec<RawNamed>,
+    #[serde(default)]
+    keywords: Option<RawKeywords>,
+    #[serde(default)]
+    external_ids: Option<RawExternalIds>,
+    #[serde(default)]
+    seasons: Vec<RawSeason>,
+}
+
+/// `/tv/{id}`'s `seasons`.
+#[derive(Debug, Deserialize)]
+struct RawSeason {
+    season_number: Option<i32>,
+    name: Option<String>,
+    overview: Option<String>,
+    poster_path: Option<String>,
+    episode_count: Option<i32>,
+    air_date: Option<String>,
+}
+
+/// `/tv/{id}/season/{n}`.
+#[derive(Debug, Deserialize)]
+struct RawSeasonDetails {
+    #[serde(default)]
+    episodes: Vec<RawEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEpisode {
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    name: Option<String>,
+    overview: Option<String>,
+    runtime: Option<u32>,
+    vote_average: Option<f64>,
+    vote_count: Option<u64>,
+    still_path: Option<String>,
+    air_date: Option<String>,
+}
+
+fn seasons_from(raw: Vec<RawSeason>) -> Vec<ProviderSeason> {
+    let mut seasons: Vec<ProviderSeason> = raw
+        .into_iter()
+        .filter_map(|s| {
+            Some(ProviderSeason {
+                number: s.season_number.filter(|n| *n >= 0)?,
+                name: blank_to_none(s.name),
+                overview: blank_to_none(s.overview),
+                poster_url: s.poster_path.as_deref().map(|p| image_url(p, "w500")),
+                episode_count: s.episode_count.filter(|c| *c > 0),
+                air_year: s.air_date.as_deref().and_then(year_from_release_date),
+            })
+        })
+        .collect();
+    seasons.sort_by_key(|s| s.number);
+    seasons.dedup_by_key(|s| s.number);
+    seasons
+}
+
+fn episodes_from(raw: RawSeasonDetails, season: i32) -> Vec<ProviderEpisode> {
+    raw.episodes
+        .into_iter()
+        .filter_map(|e| {
+            Some(ProviderEpisode {
+                season: e.season_number.unwrap_or(season),
+                episode: e.episode_number.filter(|n| *n >= 0)?,
+                title: blank_to_none(e.name),
+                overview: blank_to_none(e.overview),
+                runtime_minutes: e.runtime.filter(|r| *r > 0),
+                rating: rating_from(e.vote_average, e.vote_count),
+                still_url: e.still_path.as_deref().map(|p| image_url(p, "w780")),
+                air_date: tmdb_date(e.air_date),
+            })
+        })
+        .collect()
 }
 
 /// What [`TmdbClient::series_details`] returns.
@@ -522,6 +711,8 @@ pub struct TmdbSeriesDetails {
     pub backdrop_path: Option<String>,
     /// `(country, rating)` pairs.
     pub ratings: Vec<(String, String)>,
+    pub extras: TmdbExtras,
+    pub seasons: Vec<ProviderSeason>,
 }
 
 fn ratings_from(raw: RawContentRatings) -> Vec<(String, String)> {
@@ -884,11 +1075,23 @@ impl TmdbClient {
                 &format!("/movie/{tmdb_id}"),
                 &[
                     ("language", primary_language),
-                    ("append_to_response", "release_dates,credits"),
+                    ("append_to_response", "release_dates,credits,keywords"),
                 ],
             )
             .await?;
+        let extras = TmdbExtras {
+            original_title: blank_to_none(body.original_title),
+            tagline: blank_to_none(body.tagline),
+            runtime_minutes: body.runtime.filter(|r| *r > 0),
+            rating: rating_from(body.vote_average, body.vote_count),
+            genres: names(body.genres, 10),
+            studios: names(body.production_companies, 8),
+            keywords: names(body.keywords.map(|k| k.keywords).unwrap_or_default(), MAX_KEYWORDS),
+            imdb_id: imdb_title_id(body.imdb_id),
+            tvdb_id: None,
+        };
         Ok(TmdbMovieDetails {
+            extras,
             people: body.credits.map(people_from_credits),
             title: body.title,
             year: year_from_release_date(&body.release_date),
@@ -906,6 +1109,23 @@ impl TmdbClient {
             .get_json(&format!("/tv/{tmdb_id}/aggregate_credits"), &[])
             .await?;
         Ok(people_from_aggregate(body))
+    }
+
+    /// `/tv/{id}/season/{n}`: the season's episodes in `primary_language`.
+    /// [`TmdbError::NotFound`] for an unknown series or season.
+    pub async fn season_episodes(
+        &self,
+        tmdb_id: u64,
+        season: i32,
+        primary_language: &str,
+    ) -> Result<Vec<ProviderEpisode>, TmdbError> {
+        let body: RawSeasonDetails = self
+            .get_json(
+                &format!("/tv/{tmdb_id}/season/{season}"),
+                &[("language", primary_language)],
+            )
+            .await?;
+        Ok(episodes_from(body, season))
     }
 
     /// `/person/{id}` in `primary_language`; an empty biography is read
@@ -959,11 +1179,25 @@ impl TmdbClient {
                 &format!("/tv/{tmdb_id}"),
                 &[
                     ("language", primary_language),
-                    ("append_to_response", "content_ratings"),
+                    ("append_to_response", "content_ratings,keywords,external_ids"),
                 ],
             )
             .await?;
+        let ids = body.external_ids.unwrap_or_default();
+        let extras = TmdbExtras {
+            original_title: blank_to_none(body.original_name),
+            tagline: blank_to_none(body.tagline),
+            runtime_minutes: body.episode_run_time.iter().copied().find(|r| *r > 0),
+            rating: rating_from(body.vote_average, body.vote_count),
+            genres: names(body.genres, 10),
+            studios: names(body.production_companies, 8),
+            keywords: names(body.keywords.map(|k| k.results).unwrap_or_default(), MAX_KEYWORDS),
+            imdb_id: imdb_title_id(ids.imdb_id),
+            tvdb_id: ids.tvdb_id.filter(|id| *id > 0),
+        };
         Ok(TmdbSeriesDetails {
+            extras,
+            seasons: seasons_from(body.seasons),
             title: body.name,
             year: year_from_release_date(&body.first_air_date),
             overview: body.overview,
@@ -1128,6 +1362,7 @@ fn add_details(fields: &mut serde_json::Value, details: &TmdbMovieDetails) {
         })
         .unwrap_or(serde_json::Value::Null);
     add_age_rating(fields, &details.certifications);
+    add_extras(fields, &details.extras);
 }
 
 /// A provider id as TMDB uses it (a number); anything else is no match.
@@ -1224,6 +1459,7 @@ impl MetadataProvider for TmdbProvider {
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
             people,
+            seasons: Vec::new(),
             fields,
         }))
     }
@@ -1252,15 +1488,22 @@ impl MetadataProvider for TmdbProvider {
             "tmdb_id": m.tmdb_id,
             "overview": m.overview,
         });
-        match client.series_content_ratings(m.tmdb_id).await {
-            Ok(ratings) => add_age_rating(&mut fields, &ratings),
-            Err(err) => tracing::warn!(
-                provider = "tmdb",
-                %err,
-                title = query.title,
-                "content rating lookup failed — no age rating this time"
-            ),
-        }
+        let seasons = match client.series_details(m.tmdb_id, primary_language).await {
+            Ok(details) => {
+                add_age_rating(&mut fields, &details.ratings);
+                add_extras(&mut fields, &details.extras);
+                details.seasons
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = "tmdb",
+                    %err,
+                    title = query.title,
+                    "series details lookup failed — no age rating, genres, tags or seasons this time"
+                );
+                Vec::new()
+            }
+        };
         let people = series_people_or_none(&client, m.tmdb_id, query.title).await;
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
@@ -1268,6 +1511,7 @@ impl MetadataProvider for TmdbProvider {
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
             people,
+            seasons,
             fields,
         }))
     }
@@ -1321,7 +1565,7 @@ impl MetadataProvider for TmdbProvider {
             return Ok(None);
         };
         let client = self.client();
-        let (fields, title, images, poster, backdrop, people) = match kind {
+        let (fields, title, images, poster, backdrop, people, seasons) = match kind {
             MediaKind::Movie => {
                 let details = match client.movie_details(tmdb_id, primary_language).await {
                     Ok(details) => details,
@@ -1337,7 +1581,7 @@ impl MetadataProvider for TmdbProvider {
                 add_details(&mut fields, &details);
                 let images = client.movie_images(tmdb_id, primary_language).await;
                 let people = details.people.clone();
-                (fields, details.title, images, details.poster_path, details.backdrop_path, people)
+                (fields, details.title, images, details.poster_path, details.backdrop_path, people, Vec::new())
             }
             MediaKind::Series => {
                 let details = match client.series_details(tmdb_id, primary_language).await {
@@ -1352,9 +1596,11 @@ impl MetadataProvider for TmdbProvider {
                     "year": details.year,
                 });
                 add_age_rating(&mut fields, &details.ratings);
+                add_extras(&mut fields, &details.extras);
                 let images = client.series_images(tmdb_id, primary_language).await;
                 let people = series_people_or_none(&client, tmdb_id, &details.title).await;
-                (fields, details.title, images, details.poster_path, details.backdrop_path, people)
+                let seasons = details.seasons.clone();
+                (fields, details.title, images, details.poster_path, details.backdrop_path, people, seasons)
             }
         };
         let logo_path = images.as_ref().ok().and_then(|i| i.logo_path.clone());
@@ -1366,8 +1612,25 @@ impl MetadataProvider for TmdbProvider {
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
             people,
+            seasons,
             fields,
         }))
+    }
+
+    async fn season_episodes(
+        &self,
+        series_id: &str,
+        season: i32,
+        primary_language: &str,
+    ) -> Result<Vec<ProviderEpisode>, ProviderError> {
+        let Some(tmdb_id) = parse_tmdb_id(series_id) else {
+            return Ok(Vec::new());
+        };
+        match self.client().season_episodes(tmdb_id, season, primary_language).await {
+            Ok(episodes) => Ok(episodes),
+            Err(TmdbError::NotFound) => Ok(Vec::new()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn person(
@@ -1944,7 +2207,7 @@ mod tests {
             .and(path("/movie/11"))
             .and(query_param("api_key", "test-key"))
             .and(query_param("language", "pl"))
-            .and(query_param("append_to_response", "release_dates,credits"))
+            .and(query_param("append_to_response", "release_dates,credits,keywords"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 11,
                 "belongs_to_collection": {
@@ -2048,6 +2311,59 @@ mod tests {
     }
 
     #[test]
+    fn ratings_need_votes_and_imdb_ids_their_prefix() {
+        assert_eq!(rating_from(Some(6.534), Some(3)), Some(6.5));
+        assert_eq!(rating_from(Some(7.0), Some(0)), None);
+        assert_eq!(rating_from(Some(0.0), Some(10)), None);
+        assert_eq!(imdb_title_id(Some("tt0322259".into())).as_deref(), Some("tt0322259"));
+        assert_eq!(imdb_title_id(Some("nm0000148".into())), None);
+        assert_eq!(imdb_title_id(Some("".into())), None);
+    }
+
+    #[tokio::test]
+    async fn season_episodes_read_titles_stills_and_scores() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tv/1396/season/1"))
+            .and(query_param("language", "pl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "episodes": [
+                    { "episode_number": 1, "season_number": 1, "name": "Najwyższy czas", "overview": "Walter...",
+                      "runtime": 58, "vote_average": 8.3, "vote_count": 120, "still_path": "/e1.jpg", "air_date": "2008-01-20" },
+                    { "episode_number": 2, "name": " ", "runtime": 0, "vote_average": 9.0, "vote_count": 0 },
+                    { "name": "no number" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tv/1396/season/9"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let provider = TmdbProvider::with_base_url("test-key", server.uri());
+        let episodes = provider.season_episodes("1396", 1, "pl").await.unwrap();
+        assert_eq!(
+            episodes,
+            vec![
+                ProviderEpisode {
+                    season: 1,
+                    episode: 1,
+                    title: Some("Najwyższy czas".into()),
+                    overview: Some("Walter...".into()),
+                    runtime_minutes: Some(58),
+                    rating: Some(8.3),
+                    still_url: Some("https://image.tmdb.org/t/p/w780/e1.jpg".into()),
+                    air_date: Some("2008-01-20".into()),
+                },
+                ProviderEpisode { season: 1, episode: 2, ..ProviderEpisode::default() },
+            ]
+        );
+        assert!(provider.season_episodes("1396", 9, "pl").await.unwrap().is_empty());
+        assert!(provider.season_episodes("x", 1, "pl").await.unwrap().is_empty());
+    }
+
+    #[test]
     fn tmdb_dates_must_look_like_dates() {
         assert_eq!(tmdb_date(Some("1942-07-13".into())).as_deref(), Some("1942-07-13"));
         assert_eq!(tmdb_date(Some("".into())), None);
@@ -2135,6 +2451,14 @@ mod tests {
                 "release_dates": { "results": [
                     { "iso_3166_1": "US", "release_dates": [{ "certification": "PG", "type": 3 }] }
                 ]},
+                "original_title": "2 Fast 2 Furious",
+                "tagline": "Jak szybko lubisz?",
+                "runtime": 108,
+                "vote_average": 6.53, "vote_count": 7000,
+                "genres": [{ "name": "Akcja" }, { "name": "Kryminał" }],
+                "production_companies": [{ "name": "Universal Pictures" }],
+                "imdb_id": "tt0322259",
+                "keywords": { "keywords": [{ "name": "car race" }, { "name": " " }] },
                 "credits": {
                     "cast": [{ "id": 2, "name": "Mark Hamill", "character": "Luke Skywalker", "order": 0 }],
                     "crew": [{ "id": 1, "name": "George Lucas", "job": "Director" }]
@@ -2163,6 +2487,15 @@ mod tests {
         assert_eq!(found.fields["age_rating"], 10);
         assert_eq!(found.fields["certification"], "PG");
         assert_eq!(found.fields["certification_country"], "US");
+        assert_eq!(found.fields["original_title"], "2 Fast 2 Furious");
+        assert_eq!(found.fields["tagline"], "Jak szybko lubisz?");
+        assert_eq!(found.fields["runtime_minutes"], 108);
+        assert_eq!(found.fields["rating"], 6.5);
+        assert_eq!(found.fields["genres"], serde_json::json!(["Akcja", "Kryminał"]));
+        assert_eq!(found.fields["studios"], serde_json::json!(["Universal Pictures"]));
+        assert_eq!(found.fields["tags"], serde_json::json!(["car race"]));
+        assert_eq!(found.fields["imdb_id"], "tt0322259");
+        assert!(found.fields.get("tvdb_id").is_none());
         let people = found.people.expect("credits were appended");
         assert_eq!(
             people.iter().map(|p| (p.name.as_str(), p.role)).collect::<Vec<_>>(),
@@ -2257,7 +2590,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/movie/11"))
-            .and(query_param("append_to_response", "release_dates,credits"))
+            .and(query_param("append_to_response", "release_dates,credits,keywords"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "title": "Gwiezdne wojny", "release_date": "1977-05-25", "overview": "Dawno temu...",
                 "poster_path": "/p.jpg", "backdrop_path": "/b.jpg",
@@ -2275,7 +2608,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/tv/34"))
-            .and(query_param("append_to_response", "content_ratings"))
+            .and(query_param("append_to_response", "content_ratings,keywords,external_ids"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": "Inazuma Eleven", "first_air_date": "2008-10-05", "overview": "Piłka",
                 "poster_path": "/ie.jpg",
@@ -2332,12 +2665,26 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/tv/1396/content_ratings"))
+            .and(path("/tv/1396"))
+            .and(query_param("append_to_response", "content_ratings,keywords,external_ids"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "results": [
+                "name": "Breaking Bad",
+                "original_name": "Breaking Bad",
+                "tagline": "Remember my name",
+                "episode_run_time": [0, 47],
+                "vote_average": 8.912, "vote_count": 15000,
+                "genres": [{ "name": "Dramat" }, { "name": "Kryminał" }],
+                "production_companies": [{ "name": "Sony Pictures Television" }],
+                "keywords": { "results": [{ "name": "drug dealer" }, { "name": "drug dealer" }, { "name": "new mexico" }] },
+                "external_ids": { "imdb_id": "tt0903747", "tvdb_id": 81189 },
+                "seasons": [
+                    { "season_number": 1, "name": "Sezon 1", "overview": "", "poster_path": "/s1.jpg", "episode_count": 7, "air_date": "2008-01-20" },
+                    { "season_number": 0, "name": "Odcinki specjalne", "poster_path": null, "episode_count": 0 }
+                ],
+                "content_ratings": { "results": [
                     { "iso_3166_1": "DE", "rating": "16" },
                     { "iso_3166_1": "US", "rating": "TV-MA" }
-                ]
+                ]}
             })))
             .mount(&server)
             .await;
@@ -2351,5 +2698,34 @@ mod tests {
         assert_eq!(found.fields["age_rating"], 17);
         assert_eq!(found.fields["certification"], "TV-MA");
         assert!(found.fields.get("collection").is_none());
+        assert_eq!(found.fields["tagline"], "Remember my name");
+        assert_eq!(found.fields["runtime_minutes"], 47);
+        assert_eq!(found.fields["rating"], 8.9);
+        assert_eq!(found.fields["genres"], serde_json::json!(["Dramat", "Kryminał"]));
+        assert_eq!(found.fields["tags"], serde_json::json!(["drug dealer", "new mexico"]));
+        assert_eq!(found.fields["studios"], serde_json::json!(["Sony Pictures Television"]));
+        assert_eq!(found.fields["imdb_id"], "tt0903747");
+        assert_eq!(found.fields["tvdb_id"], 81189);
+        assert_eq!(
+            found.seasons,
+            vec![
+                ProviderSeason {
+                    number: 0,
+                    name: Some("Odcinki specjalne".into()),
+                    overview: None,
+                    poster_url: None,
+                    episode_count: None,
+                    air_year: None,
+                },
+                ProviderSeason {
+                    number: 1,
+                    name: Some("Sezon 1".into()),
+                    overview: None,
+                    poster_url: Some("https://image.tmdb.org/t/p/w500/s1.jpg".into()),
+                    episode_count: Some(7),
+                    air_year: Some(2008),
+                },
+            ]
+        );
     }
 }

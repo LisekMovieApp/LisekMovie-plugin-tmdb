@@ -18,7 +18,10 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lisek_plugin_api::{MetadataProvider, MovieQuery, ProviderError, ProviderMatch, SeriesQuery};
+use lisek_plugin_api::{
+    MediaKind, MetadataProvider, MovieQuery, PersonRole, ProviderCandidate, ProviderError,
+    ProviderMatch, ProviderPerson, ProviderPersonDetails, SeriesQuery,
+};
 use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
@@ -45,6 +48,8 @@ pub enum TmdbError {
     Unauthorized,
     #[error("TMDB returned an unexpected response: {0}")]
     UnexpectedResponse(String),
+    #[error("TMDB has no such item")]
+    NotFound,
 }
 
 impl From<reqwest::Error> for TmdbError {
@@ -59,6 +64,7 @@ impl From<TmdbError> for ProviderError {
             TmdbError::Request(msg) => ProviderError::Request(msg),
             TmdbError::Unauthorized => ProviderError::Unauthorized,
             TmdbError::UnexpectedResponse(msg) => ProviderError::UnexpectedResponse(msg),
+            TmdbError::NotFound => ProviderError::UnexpectedResponse("not found".to_string()),
         }
     }
 }
@@ -77,6 +83,7 @@ pub struct TmdbMovieMatch {
 pub struct TmdbSeriesMatch {
     pub tmdb_id: u64,
     pub title: String,
+    pub year: Option<i32>,
     pub overview: String,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
@@ -197,6 +204,8 @@ struct RawSeriesResult {
     id: u64,
     name: String,
     #[serde(default)]
+    first_air_date: String,
+    #[serde(default)]
     overview: String,
     poster_path: Option<String>,
     backdrop_path: Option<String>,
@@ -215,16 +224,248 @@ pub struct TmdbCollectionRef {
 /// What [`TmdbClient::movie_details`] adds to a search match.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TmdbMovieDetails {
+    pub title: String,
+    pub year: Option<i32>,
+    pub overview: String,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
     pub collection: Option<TmdbCollectionRef>,
     /// `(country, certification)` pairs, e.g. `("US", "PG-13")`.
     pub certifications: Vec<(String, String)>,
+    /// Main cast, directors and writers; `None` without `credits`.
+    pub people: Option<Vec<ProviderPerson>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawMovieDetails {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    release_date: String,
+    #[serde(default)]
+    overview: String,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
     belongs_to_collection: Option<TmdbCollectionRef>,
     #[serde(default)]
     release_dates: Option<RawReleaseDates>,
+    #[serde(default)]
+    credits: Option<RawCredits>,
+}
+
+/// Actors billed beyond this are left out (TMDB lists every extra).
+pub const MAX_ACTORS: usize = 20;
+/// Directors and writers kept per title.
+pub const MAX_CREW_PER_ROLE: usize = 4;
+
+/// `/movie/{id}/credits` (appended as `credits`).
+#[derive(Debug, Default, Deserialize)]
+struct RawCredits {
+    #[serde(default)]
+    cast: Vec<RawCast>,
+    #[serde(default)]
+    crew: Vec<RawCrew>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCast {
+    id: u64,
+    #[serde(default)]
+    name: String,
+    character: Option<String>,
+    #[serde(default)]
+    order: i32,
+    profile_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCrew {
+    id: u64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    job: String,
+    profile_path: Option<String>,
+}
+
+/// `/tv/{id}/aggregate_credits`: every season's credits folded per person.
+#[derive(Debug, Default, Deserialize)]
+struct RawAggregateCredits {
+    #[serde(default)]
+    cast: Vec<RawAggregateCast>,
+    #[serde(default)]
+    crew: Vec<RawAggregateCrew>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregateCast {
+    id: u64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    order: i32,
+    profile_path: Option<String>,
+    #[serde(default)]
+    roles: Vec<RawAggregateRole>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregateRole {
+    character: Option<String>,
+    #[serde(default)]
+    episode_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregateCrew {
+    id: u64,
+    #[serde(default)]
+    name: String,
+    profile_path: Option<String>,
+    #[serde(default)]
+    jobs: Vec<RawAggregateJob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregateJob {
+    #[serde(default)]
+    job: String,
+    #[serde(default)]
+    episode_count: u32,
+}
+
+/// The crew role a TMDB job counts as, if any.
+fn crew_role(job: &str) -> Option<PersonRole> {
+    match job {
+        "Director" => Some(PersonRole::Director),
+        "Screenplay" | "Writer" | "Teleplay" | "Story" | "Novel" => Some(PersonRole::Writer),
+        _ => None,
+    }
+}
+
+fn blank_to_none(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Credits in the order TMDB bills them: the first [`MAX_ACTORS`] actors,
+/// then up to [`MAX_CREW_PER_ROLE`] directors and writers each (one entry
+/// per person and role). Nameless entries are dropped.
+fn people_from_credits(raw: RawCredits) -> Vec<ProviderPerson> {
+    let mut cast = raw.cast;
+    cast.sort_by_key(|c| c.order);
+    let mut people: Vec<ProviderPerson> = cast
+        .into_iter()
+        .filter(|c| !c.name.trim().is_empty())
+        .take(MAX_ACTORS)
+        .enumerate()
+        .map(|(order, c)| ProviderPerson {
+            provider_id: c.id.to_string(),
+            name: c.name.trim().to_string(),
+            role: PersonRole::Actor,
+            character: blank_to_none(c.character),
+            order: order as i32,
+            profile_url: thumb(c.profile_path.as_deref()),
+        })
+        .collect();
+    for role in [PersonRole::Director, PersonRole::Writer] {
+        let mut seen = std::collections::HashSet::new();
+        let crew = raw
+            .crew
+            .iter()
+            .filter(|c| crew_role(&c.job) == Some(role) && !c.name.trim().is_empty())
+            .filter(|c| seen.insert(c.id))
+            .take(MAX_CREW_PER_ROLE);
+        people.extend(crew.enumerate().map(|(order, c)| ProviderPerson {
+            provider_id: c.id.to_string(),
+            name: c.name.trim().to_string(),
+            role,
+            character: None,
+            order: order as i32,
+            profile_url: thumb(c.profile_path.as_deref()),
+        }));
+    }
+    people
+}
+
+/// The same for a series: an actor's character is the one they play in
+/// most episodes; directors and writers are ranked by episode count.
+fn people_from_aggregate(raw: RawAggregateCredits) -> Vec<ProviderPerson> {
+    let mut cast = raw.cast;
+    cast.sort_by_key(|c| c.order);
+    let mut people: Vec<ProviderPerson> = cast
+        .into_iter()
+        .filter(|c| !c.name.trim().is_empty())
+        .take(MAX_ACTORS)
+        .enumerate()
+        .map(|(order, c)| {
+            let character = c
+                .roles
+                .into_iter()
+                .max_by_key(|r| r.episode_count)
+                .and_then(|r| blank_to_none(r.character));
+            ProviderPerson {
+                provider_id: c.id.to_string(),
+                name: c.name.trim().to_string(),
+                role: PersonRole::Actor,
+                character,
+                order: order as i32,
+                profile_url: thumb(c.profile_path.as_deref()),
+            }
+        })
+        .collect();
+    for role in [PersonRole::Director, PersonRole::Writer] {
+        let mut ranked: Vec<(u32, &RawAggregateCrew)> = raw
+            .crew
+            .iter()
+            .filter(|c| !c.name.trim().is_empty())
+            .filter_map(|c| {
+                let episodes: u32 = c
+                    .jobs
+                    .iter()
+                    .filter(|j| crew_role(&j.job) == Some(role))
+                    .map(|j| j.episode_count)
+                    .sum();
+                (episodes > 0).then_some((episodes, c))
+            })
+            .collect();
+        ranked.sort_by_key(|(episodes, _)| std::cmp::Reverse(*episodes));
+        people.extend(ranked.into_iter().take(MAX_CREW_PER_ROLE).enumerate().map(
+            |(order, (_, c))| ProviderPerson {
+                provider_id: c.id.to_string(),
+                name: c.name.trim().to_string(),
+                role,
+                character: None,
+                order: order as i32,
+                profile_url: thumb(c.profile_path.as_deref()),
+            },
+        ));
+    }
+    people
+}
+
+/// `/person/{id}`.
+#[derive(Debug, Deserialize)]
+struct RawPerson {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    biography: String,
+    birthday: Option<String>,
+    deathday: Option<String>,
+    place_of_birth: Option<String>,
+    imdb_id: Option<String>,
+    profile_path: Option<String>,
+}
+
+/// A `YYYY-MM-DD` date as TMDB writes it; anything else is dropped.
+fn tmdb_date(value: Option<String>) -> Option<String> {
+    let value = blank_to_none(value)?;
+    let bytes = value.as_bytes();
+    let shaped = value.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && value.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    shaped.then_some(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +495,41 @@ struct RawRelease {
 struct RawContentRatings {
     #[serde(default)]
     results: Vec<RawContentRating>,
+}
+
+/// `/tv/{id}` with `content_ratings` appended.
+#[derive(Debug, Deserialize)]
+struct RawSeriesDetails {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    first_air_date: String,
+    #[serde(default)]
+    overview: String,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    content_ratings: Option<RawContentRatings>,
+}
+
+/// What [`TmdbClient::series_details`] returns.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TmdbSeriesDetails {
+    pub title: String,
+    pub year: Option<i32>,
+    pub overview: String,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    /// `(country, rating)` pairs.
+    pub ratings: Vec<(String, String)>,
+}
+
+fn ratings_from(raw: RawContentRatings) -> Vec<(String, String)> {
+    raw.results
+        .into_iter()
+        .filter(|r| !r.rating.trim().is_empty())
+        .map(|r| (r.iso_3166_1, r.rating.trim().to_string()))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +664,7 @@ impl From<RawSeriesResult> for TmdbSeriesMatch {
     fn from(raw: RawSeriesResult) -> Self {
         TmdbSeriesMatch {
             tmdb_id: raw.id,
+            year: year_from_release_date(&raw.first_air_date),
             title: raw.name,
             overview: raw.overview,
             poster_path: raw.poster_path,
@@ -607,13 +884,55 @@ impl TmdbClient {
                 &format!("/movie/{tmdb_id}"),
                 &[
                     ("language", primary_language),
-                    ("append_to_response", "release_dates"),
+                    ("append_to_response", "release_dates,credits"),
                 ],
             )
             .await?;
         Ok(TmdbMovieDetails {
+            people: body.credits.map(people_from_credits),
+            title: body.title,
+            year: year_from_release_date(&body.release_date),
+            overview: body.overview,
+            poster_path: body.poster_path,
+            backdrop_path: body.backdrop_path,
             collection: body.belongs_to_collection,
             certifications: body.release_dates.map(certifications_from).unwrap_or_default(),
+        })
+    }
+
+    /// `/tv/{id}/aggregate_credits`: the series' main cast and crew.
+    pub async fn series_people(&self, tmdb_id: u64) -> Result<Vec<ProviderPerson>, TmdbError> {
+        let body: RawAggregateCredits = self
+            .get_json(&format!("/tv/{tmdb_id}/aggregate_credits"), &[])
+            .await?;
+        Ok(people_from_aggregate(body))
+    }
+
+    /// `/person/{id}` in `primary_language`; an empty biography is read
+    /// again in English (TMDB rarely has one in every language).
+    /// [`TmdbError::NotFound`] for an unknown id.
+    pub async fn person(
+        &self,
+        tmdb_id: u64,
+        primary_language: &str,
+    ) -> Result<ProviderPersonDetails, TmdbError> {
+        let path = format!("/person/{tmdb_id}");
+        let body: RawPerson = self.get_json(&path, &[("language", primary_language)]).await?;
+        let mut biography = body.biography.trim().to_string();
+        if biography.is_empty() && !primary_language.starts_with("en") {
+            match self.get_json::<RawPerson>(&path, &[("language", "en-US")]).await {
+                Ok(english) => biography = english.biography.trim().to_string(),
+                Err(err) => tracing::debug!(provider = "tmdb", %err, "english biography lookup failed"),
+            }
+        }
+        Ok(ProviderPersonDetails {
+            name: body.name.trim().to_string(),
+            biography,
+            birth_date: tmdb_date(body.birthday),
+            death_date: tmdb_date(body.deathday),
+            birth_place: blank_to_none(body.place_of_birth),
+            imdb_id: blank_to_none(body.imdb_id),
+            profile_url: body.profile_path.as_deref().map(|p| image_url(p, "h632")),
         })
     }
 
@@ -625,12 +944,65 @@ impl TmdbClient {
         let body: RawContentRatings = self
             .get_json(&format!("/tv/{tmdb_id}/content_ratings"), &[])
             .await?;
-        Ok(body
-            .results
-            .into_iter()
-            .filter(|r| !r.rating.trim().is_empty())
-            .map(|r| (r.iso_3166_1, r.rating.trim().to_string()))
-            .collect())
+        Ok(ratings_from(body))
+    }
+
+    /// `/tv/{id}` with its content ratings: what "Fix match" needs to
+    /// apply a series picked by id. [`TmdbError::NotFound`] for an unknown id.
+    pub async fn series_details(
+        &self,
+        tmdb_id: u64,
+        primary_language: &str,
+    ) -> Result<TmdbSeriesDetails, TmdbError> {
+        let body: RawSeriesDetails = self
+            .get_json(
+                &format!("/tv/{tmdb_id}"),
+                &[
+                    ("language", primary_language),
+                    ("append_to_response", "content_ratings"),
+                ],
+            )
+            .await?;
+        Ok(TmdbSeriesDetails {
+            title: body.name,
+            year: year_from_release_date(&body.first_air_date),
+            overview: body.overview,
+            poster_path: body.poster_path,
+            backdrop_path: body.backdrop_path,
+            ratings: body.content_ratings.map(ratings_from).unwrap_or_default(),
+        })
+    }
+
+    /// Every movie result for one exact query (no shortening), best first.
+    pub async fn search_movie_results(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        primary_language: &str,
+    ) -> Result<Vec<TmdbMovieMatch>, TmdbError> {
+        let year = year.map(|y| y.to_string());
+        let mut params = vec![("query", title), ("language", primary_language)];
+        if let Some(year) = year.as_deref() {
+            params.push(("year", year));
+        }
+        let body: SearchResponse<RawMovieResult> = self.get_json("/search/movie", &params).await?;
+        Ok(body.results.into_iter().map(Into::into).collect())
+    }
+
+    /// Every series result for one exact query (no shortening), best first.
+    pub async fn search_series_results(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        primary_language: &str,
+    ) -> Result<Vec<TmdbSeriesMatch>, TmdbError> {
+        let year = year.map(|y| y.to_string());
+        let mut params = vec![("query", title), ("language", primary_language)];
+        if let Some(year) = year.as_deref() {
+            params.push(("first_air_date_year", year));
+        }
+        let body: SearchResponse<RawSeriesResult> = self.get_json("/search/tv", &params).await?;
+        Ok(body.results.into_iter().map(Into::into).collect())
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -648,6 +1020,9 @@ impl TmdbClient {
             .await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(TmdbError::Unauthorized);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(TmdbError::NotFound);
         }
         response
             .error_for_status()?
@@ -737,6 +1112,34 @@ fn images_or_fallback(
     )
 }
 
+/// `fields.collection` (or `null`) and the age rating from a movie's
+/// details.
+fn add_details(fields: &mut serde_json::Value, details: &TmdbMovieDetails) {
+    fields["collection"] = details
+        .collection
+        .as_ref()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id.to_string(),
+                "name": c.name,
+                "poster_url": c.poster_path.as_deref().map(|p| image_url(p, "w500")),
+                "backdrop_url": c.backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    add_age_rating(fields, &details.certifications);
+}
+
+/// A provider id as TMDB uses it (a number); anything else is no match.
+fn parse_tmdb_id(provider_id: &str) -> Option<u64> {
+    provider_id.trim().parse().ok()
+}
+
+/// Search results show a small poster.
+fn thumb(path: Option<&str>) -> Option<String> {
+    path.map(|p| image_url(p, "w185"))
+}
+
 /// The [`lisek_plugin_api::MetadataProvider`] implementation `lisek-
 /// server`'s provider registry constructs one of per scan, from the API
 /// key `provider_config` has stored for `"tmdb"` — see that crate's own
@@ -800,33 +1203,27 @@ impl MetadataProvider for TmdbProvider {
         // Collection and certification. A failed lookup leaves both keys
         // out (the server then keeps the film's current collection); a
         // successful one without a collection says so with `null`.
-        match client.movie_details(m.tmdb_id, primary_language).await {
+        let people = match client.movie_details(m.tmdb_id, primary_language).await {
             Ok(details) => {
-                fields["collection"] = details
-                    .collection
-                    .map(|c| {
-                        serde_json::json!({
-                            "id": c.id.to_string(),
-                            "name": c.name,
-                            "poster_url": c.poster_path.as_deref().map(|p| image_url(p, "w500")),
-                            "backdrop_url": c.backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
-                        })
-                    })
-                    .unwrap_or(serde_json::Value::Null);
-                add_age_rating(&mut fields, &details.certifications);
+                add_details(&mut fields, &details);
+                details.people
             }
-            Err(err) => tracing::warn!(
-                provider = "tmdb",
-                %err,
-                title = query.title,
-                "movie details lookup failed — no collection or age rating this time"
-            ),
-        }
+            Err(err) => {
+                tracing::warn!(
+                    provider = "tmdb",
+                    %err,
+                    title = query.title,
+                    "movie details lookup failed — no collection, age rating or cast this time"
+                );
+                None
+            }
+        };
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
+            people,
             fields,
         }))
     }
@@ -864,13 +1261,143 @@ impl MetadataProvider for TmdbProvider {
                 "content rating lookup failed — no age rating this time"
             ),
         }
+        let people = series_people_or_none(&client, m.tmdb_id, query.title).await;
         Ok(Some(ProviderMatch {
             poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
             backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
             logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
             banner_url: None,
+            people,
             fields,
         }))
+    }
+
+    async fn search(
+        &self,
+        kind: MediaKind,
+        title: &str,
+        year: Option<i32>,
+        primary_language: &str,
+    ) -> Result<Vec<ProviderCandidate>, ProviderError> {
+        const LIMIT: usize = 10;
+        let client = self.client();
+        Ok(match kind {
+            MediaKind::Movie => client
+                .search_movie_results(title, year, primary_language)
+                .await?
+                .into_iter()
+                .take(LIMIT)
+                .map(|m| ProviderCandidate {
+                    provider_id: m.tmdb_id.to_string(),
+                    poster_url: thumb(m.poster_path.as_deref()),
+                    title: m.title,
+                    year: m.year,
+                    overview: m.overview,
+                })
+                .collect(),
+            MediaKind::Series => client
+                .search_series_results(title, year, primary_language)
+                .await?
+                .into_iter()
+                .take(LIMIT)
+                .map(|m| ProviderCandidate {
+                    provider_id: m.tmdb_id.to_string(),
+                    poster_url: thumb(m.poster_path.as_deref()),
+                    title: m.title,
+                    year: m.year,
+                    overview: m.overview,
+                })
+                .collect(),
+        })
+    }
+
+    async fn lookup(
+        &self,
+        kind: MediaKind,
+        provider_id: &str,
+        primary_language: &str,
+    ) -> Result<Option<ProviderMatch>, ProviderError> {
+        let Some(tmdb_id) = parse_tmdb_id(provider_id) else {
+            return Ok(None);
+        };
+        let client = self.client();
+        let (fields, title, images, poster, backdrop, people) = match kind {
+            MediaKind::Movie => {
+                let details = match client.movie_details(tmdb_id, primary_language).await {
+                    Ok(details) => details,
+                    Err(TmdbError::NotFound) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let mut fields = serde_json::json!({
+                    "tmdb_id": tmdb_id,
+                    "overview": details.overview,
+                    "title": details.title,
+                    "year": details.year,
+                });
+                add_details(&mut fields, &details);
+                let images = client.movie_images(tmdb_id, primary_language).await;
+                let people = details.people.clone();
+                (fields, details.title, images, details.poster_path, details.backdrop_path, people)
+            }
+            MediaKind::Series => {
+                let details = match client.series_details(tmdb_id, primary_language).await {
+                    Ok(details) => details,
+                    Err(TmdbError::NotFound) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let mut fields = serde_json::json!({
+                    "tmdb_id": tmdb_id,
+                    "overview": details.overview,
+                    "title": details.title,
+                    "year": details.year,
+                });
+                add_age_rating(&mut fields, &details.ratings);
+                let images = client.series_images(tmdb_id, primary_language).await;
+                let people = series_people_or_none(&client, tmdb_id, &details.title).await;
+                (fields, details.title, images, details.poster_path, details.backdrop_path, people)
+            }
+        };
+        let logo_path = images.as_ref().ok().and_then(|i| i.logo_path.clone());
+        let (poster_path, backdrop_path) =
+            images_or_fallback(images, &title, poster.as_deref(), backdrop.as_deref());
+        Ok(Some(ProviderMatch {
+            poster_url: poster_path.as_deref().map(|p| image_url(p, "w500")),
+            backdrop_url: backdrop_path.as_deref().map(|p| image_url(p, "w1280")),
+            logo_url: logo_path.as_deref().map(|p| image_url(p, "w500")),
+            banner_url: None,
+            people,
+            fields,
+        }))
+    }
+
+    async fn person(
+        &self,
+        provider_id: &str,
+        primary_language: &str,
+    ) -> Result<Option<ProviderPersonDetails>, ProviderError> {
+        let Some(tmdb_id) = parse_tmdb_id(provider_id) else {
+            return Ok(None);
+        };
+        match self.client().person(tmdb_id, primary_language).await {
+            Ok(person) => Ok(Some(person)),
+            Err(TmdbError::NotFound) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// A series' cast, or `None` (keep what the item has) when the lookup failed.
+async fn series_people_or_none(
+    client: &TmdbClient,
+    tmdb_id: u64,
+    title: &str,
+) -> Option<Vec<ProviderPerson>> {
+    match client.series_people(tmdb_id).await {
+        Ok(people) => Some(people),
+        Err(err) => {
+            tracing::warn!(provider = "tmdb", %err, title, "series credits lookup failed — no cast this time");
+            None
+        }
     }
 }
 
@@ -1022,6 +1549,7 @@ mod tests {
             Some(TmdbSeriesMatch {
                 tmdb_id: 1396,
                 title: "Breaking Bad".to_string(),
+                year: None,
                 overview: "A high school chemistry teacher...".to_string(),
                 poster_path: Some("/ggFHVNu6YYI5L9pCfOacjizRGt.jpg".to_string()),
                 backdrop_path: Some("/tsRy63Mu5cu8etL1X7ZLyf7UP1M.jpg".to_string()),
@@ -1416,7 +1944,7 @@ mod tests {
             .and(path("/movie/11"))
             .and(query_param("api_key", "test-key"))
             .and(query_param("language", "pl"))
-            .and(query_param("append_to_response", "release_dates"))
+            .and(query_param("append_to_response", "release_dates,credits"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 11,
                 "belongs_to_collection": {
@@ -1452,6 +1980,127 @@ mod tests {
         assert_eq!(details.certifications, vec![("US".to_string(), "PG".to_string())]);
     }
 
+    #[test]
+    fn movie_credits_keep_billing_order_and_main_crew() {
+        let raw: RawCredits = serde_json::from_value(serde_json::json!({
+            "cast": [
+                { "id": 3, "name": "Harrison Ford", "character": "Han Solo", "order": 1, "profile_path": "/hf.jpg" },
+                { "id": 2, "name": "Mark Hamill", "character": "Luke Skywalker", "order": 0, "profile_path": null },
+                { "id": 9, "name": " ", "character": "Nobody", "order": 2 }
+            ],
+            "crew": [
+                { "id": 1, "name": "George Lucas", "job": "Director", "profile_path": "/gl.jpg" },
+                { "id": 1, "name": "George Lucas", "job": "Writer" },
+                { "id": 1, "name": "George Lucas", "job": "Screenplay" },
+                { "id": 5, "name": "John Williams", "job": "Original Music Composer" }
+            ]
+        }))
+        .unwrap();
+        let people = people_from_credits(raw);
+        let summary: Vec<_> = people
+            .iter()
+            .map(|p| (p.provider_id.as_str(), p.role, p.character.as_deref(), p.order))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("2", PersonRole::Actor, Some("Luke Skywalker"), 0),
+                ("3", PersonRole::Actor, Some("Han Solo"), 1),
+                ("1", PersonRole::Director, None, 0),
+                ("1", PersonRole::Writer, None, 0),
+            ]
+        );
+        assert_eq!(people[1].profile_url.as_deref(), Some("https://image.tmdb.org/t/p/w185/hf.jpg"));
+        assert_eq!(people[0].profile_url, None);
+    }
+
+    #[test]
+    fn movie_credits_cap_the_cast() {
+        let cast: Vec<_> = (0..40)
+            .map(|i| serde_json::json!({ "id": i, "name": format!("Actor {i}"), "order": i }))
+            .collect();
+        let raw: RawCredits = serde_json::from_value(serde_json::json!({ "cast": cast })).unwrap();
+        assert_eq!(people_from_credits(raw).len(), MAX_ACTORS);
+    }
+
+    #[test]
+    fn series_credits_use_the_main_character_and_rank_crew_by_episodes() {
+        let raw: RawAggregateCredits = serde_json::from_value(serde_json::json!({
+            "cast": [{ "id": 7, "name": "Bryan Cranston", "order": 0, "profile_path": "/bc.jpg",
+                       "roles": [{ "character": "Narrator", "episode_count": 1 },
+                                 { "character": "Walter White", "episode_count": 62 }] }],
+            "crew": [
+                { "id": 8, "name": "Rare Director", "jobs": [{ "job": "Director", "episode_count": 1 }] },
+                { "id": 9, "name": "Main Director", "jobs": [{ "job": "Director", "episode_count": 5 }] },
+                { "id": 10, "name": "Grip", "jobs": [{ "job": "Key Grip", "episode_count": 60 }] }
+            ]
+        }))
+        .unwrap();
+        let people = people_from_aggregate(raw);
+        assert_eq!(people[0].character.as_deref(), Some("Walter White"));
+        let directors: Vec<_> = people
+            .iter()
+            .filter(|p| p.role == PersonRole::Director)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(directors, ["Main Director", "Rare Director"]);
+        assert_eq!(people.len(), 3);
+    }
+
+    #[test]
+    fn tmdb_dates_must_look_like_dates() {
+        assert_eq!(tmdb_date(Some("1942-07-13".into())).as_deref(), Some("1942-07-13"));
+        assert_eq!(tmdb_date(Some("".into())), None);
+        assert_eq!(tmdb_date(Some("1942".into())), None);
+        assert_eq!(tmdb_date(None), None);
+    }
+
+    #[tokio::test]
+    async fn person_reads_the_profile_and_falls_back_to_an_english_biography() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/person/3"))
+            .and(query_param("language", "pl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 3, "name": "Harrison Ford", "biography": "",
+                "birthday": "1942-07-13", "deathday": null,
+                "place_of_birth": "Chicago, Illinois, USA", "imdb_id": "nm0000148",
+                "profile_path": "/hf.jpg"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/person/3"))
+            .and(query_param("language", "en-US"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 3, "name": "Harrison Ford", "biography": " An American actor. "
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/person/404"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("test-key", server.uri());
+        let person = provider.person("3", "pl").await.unwrap().unwrap();
+        assert_eq!(
+            person,
+            ProviderPersonDetails {
+                name: "Harrison Ford".to_string(),
+                biography: "An American actor.".to_string(),
+                birth_date: Some("1942-07-13".to_string()),
+                death_date: None,
+                birth_place: Some("Chicago, Illinois, USA".to_string()),
+                imdb_id: Some("nm0000148".to_string()),
+                profile_url: Some("https://image.tmdb.org/t/p/h632/hf.jpg".to_string()),
+            }
+        );
+        assert_eq!(provider.person("404", "pl").await.unwrap(), None);
+        assert_eq!(provider.person("not-a-number", "pl").await.unwrap(), None);
+    }
+
     async fn mount_movie_search(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/search/movie"))
@@ -1485,7 +2134,11 @@ mod tests {
                 },
                 "release_dates": { "results": [
                     { "iso_3166_1": "US", "release_dates": [{ "certification": "PG", "type": 3 }] }
-                ]}
+                ]},
+                "credits": {
+                    "cast": [{ "id": 2, "name": "Mark Hamill", "character": "Luke Skywalker", "order": 0 }],
+                    "crew": [{ "id": 1, "name": "George Lucas", "job": "Director" }]
+                }
             })))
             .mount(&server)
             .await;
@@ -1510,6 +2163,11 @@ mod tests {
         assert_eq!(found.fields["age_rating"], 10);
         assert_eq!(found.fields["certification"], "PG");
         assert_eq!(found.fields["certification_country"], "US");
+        let people = found.people.expect("credits were appended");
+        assert_eq!(
+            people.iter().map(|p| (p.name.as_str(), p.role)).collect::<Vec<_>>(),
+            [("Mark Hamill", PersonRole::Actor), ("George Lucas", PersonRole::Director)]
+        );
         // The search result's own images are the fallback.
         assert_eq!(
             found.poster_url.as_deref(),
@@ -1535,6 +2193,7 @@ mod tests {
         assert!(found.fields["collection"].is_null());
         assert!(found.fields.get("collection").is_some());
         assert!(found.fields.get("age_rating").is_none());
+        assert_eq!(found.people, None, "no credits in the answer: keep the cast");
 
         let failing = MockServer::start().await;
         mount_movie_search(&failing).await;
@@ -1546,7 +2205,115 @@ mod tests {
         let provider = TmdbProvider::with_base_url("test-key", failing.uri());
         let found = provider.find_movie(&query, "en").await.unwrap().unwrap();
         assert!(found.fields.get("collection").is_none());
+        assert_eq!(found.people, None);
         assert_eq!(found.fields["overview"], "A long time ago...");
+    }
+
+    #[tokio::test]
+    async fn search_lists_candidates_for_the_exact_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie"))
+            .and(query_param("query", "Star Wars"))
+            .and(query_param("year", "1977"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    { "id": 11, "title": "Star Wars", "release_date": "1977-05-25",
+                      "overview": "A long time ago...", "poster_path": "/sw.jpg" },
+                    { "id": 12, "title": "Star Wars: Special", "release_date": "" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/tv"))
+            .and(query_param("first_air_date_year", "2008"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "id": 34, "name": "Inazuma Eleven", "first_air_date": "2008-10-05" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("k", server.uri());
+        let movies = provider.search(MediaKind::Movie, "Star Wars", Some(1977), "en").await.unwrap();
+        assert_eq!(movies.len(), 2);
+        assert_eq!(
+            movies[0],
+            ProviderCandidate {
+                provider_id: "11".to_string(),
+                title: "Star Wars".to_string(),
+                year: Some(1977),
+                overview: "A long time ago...".to_string(),
+                poster_url: Some("https://image.tmdb.org/t/p/w185/sw.jpg".to_string()),
+            }
+        );
+        assert_eq!(movies[1].year, None);
+        let series = provider.search(MediaKind::Series, "Inazuma", Some(2008), "pl").await.unwrap();
+        assert_eq!((series[0].provider_id.as_str(), series[0].year), ("34", Some(2008)));
+    }
+
+    #[tokio::test]
+    async fn lookup_returns_the_full_match_for_an_id_and_none_for_an_unknown_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .and(query_param("append_to_response", "release_dates,credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "Gwiezdne wojny", "release_date": "1977-05-25", "overview": "Dawno temu...",
+                "poster_path": "/p.jpg", "backdrop_path": "/b.jpg",
+                "belongs_to_collection": { "id": 10, "name": "Kolekcja", "poster_path": null, "backdrop_path": null },
+                "release_dates": { "results": [
+                    { "iso_3166_1": "US", "release_dates": [{ "certification": "PG", "type": 3 }] }
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11/images"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tv/34"))
+            .and(query_param("append_to_response", "content_ratings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "Inazuma Eleven", "first_air_date": "2008-10-05", "overview": "Piłka",
+                "poster_path": "/ie.jpg",
+                "content_ratings": { "results": [{ "iso_3166_1": "DE", "rating": "6" }] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tv/34/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posters": [{ "file_path": "/ie-pl.jpg", "iso_639_1": "pl", "vote_average": 1.0 }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movie/999"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("k", server.uri());
+        let movie = provider.lookup(MediaKind::Movie, "11", "pl").await.unwrap().unwrap();
+        assert_eq!(movie.fields["title"], "Gwiezdne wojny");
+        assert_eq!(movie.fields["year"], 1977);
+        assert_eq!(movie.fields["overview"], "Dawno temu...");
+        assert_eq!(movie.fields["collection"]["id"], "10");
+        assert_eq!(movie.fields["age_rating"], 10);
+        // The images request failed: the details' own images stand in.
+        assert_eq!(movie.poster_url.as_deref(), Some("https://image.tmdb.org/t/p/w500/p.jpg"));
+        assert_eq!(movie.backdrop_url.as_deref(), Some("https://image.tmdb.org/t/p/w1280/b.jpg"));
+
+        let series = provider.lookup(MediaKind::Series, "34", "pl").await.unwrap().unwrap();
+        assert_eq!((series.fields["title"].as_str(), series.fields["year"].as_i64()), (Some("Inazuma Eleven"), Some(2008)));
+        assert_eq!(series.fields["age_rating"], 6);
+        assert_eq!(series.poster_url.as_deref(), Some("https://image.tmdb.org/t/p/w500/ie-pl.jpg"));
+
+        assert!(provider.lookup(MediaKind::Movie, "999", "pl").await.unwrap().is_none());
+        assert!(provider.lookup(MediaKind::Movie, "not-a-number", "pl").await.unwrap().is_none());
     }
 
     #[tokio::test]

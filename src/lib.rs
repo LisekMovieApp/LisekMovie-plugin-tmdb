@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lisek_plugin_api::{
-    MediaKind, MetadataProvider, MovieQuery, PersonRole, ProviderCandidate, ProviderEpisode,
+    DirectId, MediaKind, MetadataProvider, MovieQuery, PersonRole, ProviderCandidate, ProviderEpisode,
     ProviderError, ProviderMatch, ProviderPerson, ProviderPersonDetails, ProviderSeason,
     SeriesQuery,
 };
@@ -1239,6 +1239,35 @@ impl TmdbClient {
         Ok(body.results.into_iter().map(Into::into).collect())
     }
 
+    /// The TMDB id of the film or series with this IMDb id (`/find`).
+    /// `Ok(None)`: TMDB does not know it, or only as the other kind.
+    pub async fn find_by_imdb_id(&self, imdb_id: &str, kind: MediaKind) -> Result<Option<u64>, TmdbError> {
+        #[derive(Deserialize)]
+        struct Found {
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct FindResponse {
+            #[serde(default)]
+            movie_results: Vec<Found>,
+            #[serde(default)]
+            tv_results: Vec<Found>,
+        }
+        let found: FindResponse = match self
+            .get_json(&format!("/find/{imdb_id}"), &[("external_source", "imdb_id")])
+            .await
+        {
+            Ok(found) => found,
+            Err(TmdbError::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let results = match kind {
+            MediaKind::Movie => found.movie_results,
+            MediaKind::Series => found.tv_results,
+        };
+        Ok(results.first().map(|f| f.id))
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1615,6 +1644,26 @@ impl MetadataProvider for TmdbProvider {
             seasons,
             fields,
         }))
+    }
+
+    /// TMDB ids as they are, IMDb ids through `/find`.
+    async fn lookup_by_id(
+        &self,
+        kind: MediaKind,
+        id: &DirectId,
+        primary_language: &str,
+    ) -> Result<Option<ProviderCandidate>, ProviderError> {
+        let tmdb_id = match id {
+            DirectId::Numeric(own) => own.clone(),
+            DirectId::Imdb(imdb) => match self.client().find_by_imdb_id(imdb, kind).await? {
+                Some(found) => found.to_string(),
+                None => return Ok(None),
+            },
+        };
+        Ok(self
+            .lookup(kind, &tmdb_id, primary_language)
+            .await?
+            .and_then(|matched| ProviderCandidate::from_match(&tmdb_id, &matched)))
     }
 
     async fn season_episodes(
@@ -2647,6 +2696,46 @@ mod tests {
 
         assert!(provider.lookup(MediaKind::Movie, "999", "pl").await.unwrap().is_none());
         assert!(provider.lookup(MediaKind::Movie, "not-a-number", "pl").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_imdb_id_is_resolved_through_find() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/find/tt0076759"))
+            .and(query_param("external_source", "imdb_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "movie_results": [{ "id": 11 }], "tv_results": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "Gwiezdne wojny", "release_date": "1977-05-25", "overview": "Dawno temu...",
+                "poster_path": "/p.jpg"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movie/11/images"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let provider = TmdbProvider::with_base_url("k", server.uri());
+        let imdb = DirectId::Imdb("tt0076759".into());
+        let found = provider.lookup_by_id(MediaKind::Movie, &imdb, "pl").await.unwrap().unwrap();
+        assert_eq!((found.provider_id.as_str(), found.title.as_str(), found.year), ("11", "Gwiezdne wojny", Some(1977)));
+        // The same IMDb id is no series.
+        assert!(provider.lookup_by_id(MediaKind::Series, &imdb, "pl").await.unwrap().is_none());
+        // A TMDB id goes straight to the details.
+        let own = provider
+            .lookup_by_id(MediaKind::Movie, &DirectId::Numeric("11".into()), "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.provider_id, "11");
     }
 
     #[tokio::test]

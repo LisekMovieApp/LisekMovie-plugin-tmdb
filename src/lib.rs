@@ -254,6 +254,9 @@ pub struct TmdbExtras {
     pub keywords: Vec<String>,
     pub imdb_id: Option<String>,
     pub tvdb_id: Option<u64>,
+    /// The production's own language (`ja`, `en` …), for LisekMovie's
+    /// "original language" metadata fallback.
+    pub original_language: Option<String>,
 }
 
 /// Keywords kept per title: TMDB lists dozens for popular films.
@@ -327,6 +330,9 @@ fn add_extras(fields: &mut serde_json::Value, extras: &TmdbExtras) {
     if let Some(v) = extras.tvdb_id {
         set("tvdb_id", serde_json::json!(v));
     }
+    if let Some(v) = &extras.original_language {
+        set("original_language", serde_json::json!(v));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +351,7 @@ struct RawMovieDetails {
     #[serde(default)]
     credits: Option<RawCredits>,
     original_title: Option<String>,
+    original_language: Option<String>,
     tagline: Option<String>,
     runtime: Option<u32>,
     vote_average: Option<f64>,
@@ -616,6 +623,7 @@ struct RawSeriesDetails {
     #[serde(default)]
     content_ratings: Option<RawContentRatings>,
     original_name: Option<String>,
+    original_language: Option<String>,
     tagline: Option<String>,
     #[serde(default)]
     episode_run_time: Vec<u32>,
@@ -1089,6 +1097,7 @@ impl TmdbClient {
             keywords: names(body.keywords.map(|k| k.keywords).unwrap_or_default(), MAX_KEYWORDS),
             imdb_id: imdb_title_id(body.imdb_id),
             tvdb_id: None,
+            original_language: blank_to_none(body.original_language),
         };
         Ok(TmdbMovieDetails {
             extras,
@@ -1194,6 +1203,7 @@ impl TmdbClient {
             keywords: names(body.keywords.map(|k| k.results).unwrap_or_default(), MAX_KEYWORDS),
             imdb_id: imdb_title_id(ids.imdb_id),
             tvdb_id: ids.tvdb_id.filter(|id| *id > 0),
+            original_language: blank_to_none(body.original_language),
         };
         Ok(TmdbSeriesDetails {
             extras,
@@ -2501,6 +2511,7 @@ mod tests {
                     { "iso_3166_1": "US", "release_dates": [{ "certification": "PG", "type": 3 }] }
                 ]},
                 "original_title": "2 Fast 2 Furious",
+                "original_language": "en",
                 "tagline": "Jak szybko lubisz?",
                 "runtime": 108,
                 "vote_average": 6.53, "vote_count": 7000,
@@ -2538,6 +2549,7 @@ mod tests {
         assert_eq!(found.fields["certification_country"], "US");
         assert_eq!(found.fields["original_title"], "2 Fast 2 Furious");
         assert_eq!(found.fields["tagline"], "Jak szybko lubisz?");
+        assert_eq!(found.fields["original_language"], "en");
         assert_eq!(found.fields["runtime_minutes"], 108);
         assert_eq!(found.fields["rating"], 6.5);
         assert_eq!(found.fields["genres"], serde_json::json!(["Akcja", "Kryminał"]));
